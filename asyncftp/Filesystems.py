@@ -1,9 +1,10 @@
 import os
 import time
-from functools import wraps
+from functools import wraps, partial
 from typing import List, Iterable, TYPE_CHECKING, Union
 from stat import filemode as _filemode
 import stat
+from . import loop
 
 try:
     import pwd
@@ -13,7 +14,7 @@ except ImportError:
     grp = None
 
 if TYPE_CHECKING:
-    from FTPHandlers import FTPHandler
+    from asyncftp.FTPHandlers import FTPHandler
 
 _months_map = {1: 'Jan', 2: 'Feb', 3: 'Mar', 4: 'Apr', 5: 'May', 6: 'Jun',
                7: 'Jul', 8: 'Aug', 9: 'Sep', 10: 'Oct', 11: 'Nov', 12: 'Dec'}
@@ -31,6 +32,15 @@ def pathchecker(func):
             path = kwargs['path']
         assert isinstance(path, str)
         return func(instance, path)
+
+    return wrap
+
+
+def run_in_executor(func):
+    @wraps(func)
+    async def wrap(*args, **kwargs):
+        f = partial(func, *args, **kwargs)
+        return await loop.run_in_executor(None, f)
 
     return wrap
 
@@ -146,16 +156,19 @@ class AbstractFilesystem:
     def realpath(self, path: str) -> str:
         return os.path.realpath(path)
 
+    @run_in_executor
     def open(self, filename, mode):
         assert isinstance(filename, str)
         return open(filename, mode)
 
     @pathchecker
+    @run_in_executor
     def chdir(self, path: str) -> None:
         os.chdir(path)
         self._cwd = self.fs2ftp(path)
 
     @pathchecker
+    @run_in_executor
     def mkdir(self, path: str) -> None:
         os.mkdir(path)
 
@@ -164,17 +177,21 @@ class AbstractFilesystem:
         return os.listdir(path)
 
     @pathchecker
+    @run_in_executor
     def rmdir(self, path: str) -> None:
         os.remove(path)
 
     @pathchecker
+    @run_in_executor
     def remove(self, path: str):
         os.remove(path)
 
+    @run_in_executor
     def rename(self, src: str, dst: str) -> None:
         assert isinstance(src, str)
         os.rename(src, dst)
 
+    @run_in_executor
     def chmod(self, path: str, mode: int):
         if not hasattr(os, 'chmod'):
             raise NotImplementedError
@@ -261,6 +278,7 @@ class AbstractFilesystem:
         def get_group_by_gid(self, gid: int) -> Union[int, str]:
             return "group"
 
+    @run_in_executor
     def format_list(self, basedir: str, listing: List[str], ignore_err: bool = True) -> Iterable[str]:
         """
         :param basedir: the absolute dirname.
@@ -320,6 +338,7 @@ class AbstractFilesystem:
                 perms, nlinks, uname, gname, size, mtimestr, basename)
             yield line.encode('utf8')
 
+    @run_in_executor
     def format_mlsx(self, basedir: str, listing: List[str], perms: str,
                     facts: str, ignore_err: bool = True) -> Iterable[str]:
         """
@@ -437,6 +456,3 @@ if os.name == 'posix':
             # validpath was used to check symlinks escaping user home
             # directory; this is no longer necessary.
             return True
-
-if __name__ == '__main__':
-    pass

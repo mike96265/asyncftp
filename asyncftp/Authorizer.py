@@ -3,7 +3,7 @@ from typing import TYPE_CHECKING, Union
 import warnings
 
 if TYPE_CHECKING:
-    from FTPHandlers import FTPHandler
+    from asyncftp.FTPHandlers import FTPHandler
 
 
 class AuthorizerError(Exception):
