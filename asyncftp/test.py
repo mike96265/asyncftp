@@ -1,29 +1,21 @@
 import asyncio
 from functools import wraps
 
-loop = asyncio.get_event_loop()
+
+async def atest(a):
+    print(a)
+    await asyncio.sleep(0)
+
+    await xxx(a)
+    await asyncio.sleep(0)
+    print('ending %s' % a)
 
 
-def wrap_for_async(func):
-    @wraps(func)
-    async def wrap(*args, **kwargs):
-        await asyncio.sleep(1)
-        return print(func(*args, **kwargs))
-
-    return wrap
-
-
-@wrap_for_async
-def add(a, b):
-    return a + b
-
-
-class A:
-    a = 1
+async def xxx(a):
+    print('xxx %s' % a)
 
 
 if __name__ == '__main__':
-    a = A()
-    a.a = 2
-    b = A()
-    print(b.a)
+    a = asyncio.gather(atest('a'), atest('b'))
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(a)

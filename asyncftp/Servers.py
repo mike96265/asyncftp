@@ -1,19 +1,26 @@
 import asyncio
+from asyncio import StreamReader, StreamWriter, AbstractEventLoop
 import logging
 import socket
-from asyncio import StreamReader, StreamWriter, AbstractEventLoop
 from typing import Type
 
+from asyncftp.Authorizer import AbstractAuthorizer, DummyAuthorizer
 from asyncftp.FTPHandlers import FTPHandler
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger('asyncio')
 
 
 class AbstractServer:
     max_cons = 512
     max_cons_per_ip = 0
+    handler_class = FTPHandler
+    authorizer = DummyAuthorizer()
 
-    def __init__(self, handler_class: Type[FTPHandler], host: str, port: int = 0, loop: AbstractEventLoop = None,
+    def __init__(self,
+                 host: str, port: int = 0,
+                 handler_class: Type[FTPHandler] = None,
+                 authorizer: AbstractAuthorizer = None,
+                 loop: AbstractEventLoop = None,
                  **kwargs):
         self.loop = loop if loop else asyncio.get_running_loop()
         self.server_host = host
@@ -23,7 +30,11 @@ class AbstractServer:
             self.ssl = kwargs['ssl']
         else:
             self.ssl = None
-        self.handler_class = handler_class
+        if handler_class:
+            self.handler_class = handler_class
+        if authorizer:
+            self.authorizer = authorizer
+        handler_class.set_authorizer(authorizer)
         self.ip_map = []
 
     async def start(self):

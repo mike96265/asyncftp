@@ -19,7 +19,8 @@ class PassiveDTP(Protocol):
         else:
             masqueraded_ip = None
 
-        if self.cmd_channel.server
+        if self.cmd_channel.server:
+            pass
 
 
 class ActiveDTP:

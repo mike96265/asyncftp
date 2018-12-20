@@ -6,7 +6,7 @@ import time
 from asyncio import Protocol, Transport, AbstractEventLoop, StreamWriter, StreamReader
 from typing import Union, Tuple, TYPE_CHECKING
 
-from .Authorizer import AuthenticationFailed, AuthorizerError, DummyAuthorizer
+from .Authorizer import AuthenticationFailed, AuthorizerError, DummyAuthorizer, AbstractAuthorizer
 from .Filesystems import AbstractFilesystem
 from .dtp import ActiveDTP, PassiveDTP
 
@@ -80,7 +80,7 @@ _proto_cmds = {
         perm=None, auth=True, arg=True,
         help='Syntax: OPTS <SP> cmd [<SP> option] (set option for command).'),
     'PASS': dict(
-        perm=None, auth=False, arg=None,
+        perm=None, auth=False, arg=True,
         help='Syntax: PASS [<SP> password] (set user password).'),
     'PASV': dict(
         perm=None, auth=True, arg=False,
@@ -206,7 +206,7 @@ class FTPHandler:
     tcp_no_delay = hasattr(socket, 'TCP_NODELAY')
 
     encoding = 'utf8'
-    log_prefix_template = '%(remote_ip)s:%(remote_port)s-[%(username)s]'
+    log_prefix_template = '%(remote_host)s:%(remote_port)s-[%(username)s]'
 
     @classmethod
     def set_authorizer(cls, authorizer):
@@ -254,8 +254,8 @@ class FTPHandler:
 
     async def handle(self):
         await self.on_connect()
-        try:
-            while True:
+        while True:
+            try:
                 line, cmd, arg = await self.parse_command()
                 valid, *args = self.validate_cmd(line, cmd, arg)
                 if not valid:
@@ -265,8 +265,8 @@ class FTPHandler:
                 else:
                     cmd, arg, kwargs = args
                     await self.process_cmd(cmd, arg, **kwargs)
-        except Exception:
-            pass
+            except Exception as err:
+                print(err)
 
     async def on_connect(self):
         if len(self.banner) <= 75:
@@ -275,12 +275,18 @@ class FTPHandler:
             await self.push("220-%s\r\n" % self.banner)
             await self.respond(220)
 
+    async def on_login_failed(self, username: str, password: str):
+        pass
+
+    async def on_login(self, username: str):
+        pass
+
     async def process_cmd(self, cmd, arg, **kwargs):
         method = getattr(self, 'ftp_%s' % cmd)
         await method(arg, **kwargs)
 
     def validate_cmd(self, line: str, cmd: str, arg: str) -> \
-            Union[Tuple[False, str, str, int, str], Tuple[True, str, str, dict]]:
+            Union[Tuple[bool, str, str, int, str], Tuple[bool, str, str, dict]]:
         kwargs = {}
         if cmd == "SITE" and arg:
             cmd = "SITE %s" % arg.split(' ')[0].upper()
@@ -297,11 +303,11 @@ class FTPHandler:
             else:
                 msg = 'Command "%s" not understand.' % cmd
                 return False, cmd, arg, 500, msg
-        if not arg and self.proto_cmds[cmd]['arg']:
+        if not arg and self.proto_cmds[cmd]['arg'] is True:
             msg = "Syntax error: command needs argument."
             return False, cmd, "", 501, msg
 
-        if arg and not self.proto_cmds['arg']:
+        if arg and self.proto_cmds[cmd]['arg'] is False:
             msg = "Syntax error: command does not accept arguments."
             return False, cmd, arg, 501, msg
 
@@ -358,7 +364,7 @@ class FTPHandler:
             self.log(line)
 
     async def parse_command(self) -> Tuple[str, str, str]:
-        line = (await self.reader.readline()).decode(self.encoding)
+        line = (await self.reader.readline()).decode(self.encoding).rstrip()
         cmd = line.split(' ')[0].upper()
         arg = line[len(cmd) + 1:]
         return line, cmd, arg
@@ -370,7 +376,8 @@ class FTPHandler:
         pass
 
     async def push(self, s: str):
-        await self.writer.write(s.encode(self.encoding))
+        self.writer.write(s.encode(self.encoding))
+        await self.writer.drain()
 
     async def respond(self, code: int, msg: str = '', logfun=logger.debug):
         resp = '%d %s' % (code, msg)
@@ -401,6 +408,81 @@ class FTPHandler:
     @property
     def log_prefix(self):
         return self.log_prefix_template % self.__dict__
+
+    # identification command
+
+    async def ftp_USER(self, username: str):
+        if not self.authenticated:
+            await self.respond(331, "Username ok, send password")
+            self.username = username
+        else:
+            await self.flush_account()
+            msg = "Previous account information was flushed, send password"
+            await self.respond(331, msg, logfun=logger.info)
+
+    async def ftp_PASS(self, password: str):
+        if self.authenticated:
+            await self.respond(503, "User already authenticated.")
+            return
+        if not self.username:
+            await self.respond(503, "Login with USER first.")
+            return
+
+        try:
+            await self.authorizer.validate_authentication(self.username, password, self)
+            home = await self.authorizer.get_home_dir(self.username)
+            msg_login = await self.authorizer.get_msg_login(self.username)
+        except(AuthenticationFailed, AuthorizerError) as err:
+            await self.handle_auth_failed(str(err), password)
+        else:
+            await self.handle_auth_success(home, password, msg_login)
+
+    async def flush_account(self):
+        pass
+
+    async def handle_auth_failed(self, msg: str, password: str):
+        if not msg:
+            if self.username == 'anonymous':
+                msg = 'Anonymous access not allowed.'
+            else:
+                msg = 'Authentication failed.'
+        else:
+            msg = msg.capitalize()
+        self.attempted_login_times += 1
+        if self.attempted_login_times >= self.max_login_attempts:
+            msg += " Disconnecting."
+            await self.respond(530, msg)
+        else:
+            await self.respond(530, msg)
+        self.log("USER '%s' failed login." % self.username)
+        await self.on_login_failed(self.username, password)
+        self.username = ""
+
+    async def handle_auth_success(self, home, password, msg_login):
+        if len(msg_login) <= 75:
+            await self.respond(230, msg_login)
+        else:
+            await self.push('230-%s' % msg_login)
+            await self.respond(230)
+        self.log("USER '%s' logged in." % self.username)
+        self.authenticated = True
+        self.attempted_login_times = 0
+        self.fs = self.abstracted_fs(home, self)
+        await self.on_login(self.username)
+
+    async def ftp_REIN(self, arg):
+        """Reinitialize user's current session"""
+        await self.flush_account()
+        await self.respond(230, "Ready for new user.")
+
+    async def ftp_CWD(self):
+        pass
+
+    # file action commands
+
+    async def ftp_PWD(self, line):
+        cwd = self.fs.cwd
+        await self.respond(257, "%s is the current directory." % cwd.replace('"', '""'))
 
 
 class __FTPHandler(Protocol):

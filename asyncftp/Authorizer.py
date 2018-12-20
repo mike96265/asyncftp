@@ -14,7 +14,88 @@ class AuthenticationFailed(Exception):
     """Exception raised when authentication fails for any reason."""
 
 
-class DummyAuthorizer:
+class AbstractAuthorizer:
+    _single_instance = None
+
+    def add_user(self, username: str, password: str, homedir: str, perm: str = 'erl',
+                 msg_login: str = "Login successful", msg_quit: str = "Goodbye"):
+        """
+        Add a user.
+        :param username: username for identification, as the argument of ftp USER command
+        :param password: password specified for this user, as the argument of ftp PASS command
+        :param homedir: the initial directory when user logged in
+        :param perm: check permission when user modify directory
+        :param msg_login: customized response string when user logged in
+        :param msg_quit: customized response string when user quit
+
+        Read permissions:
+         - "e" = change directory (CWD command)
+         - "l" = list files (LIST, NLST, STAT, MLSD, MLST, SIZE, MDTM commands)
+         - "r" = retrieve file from the server (RETR command)
+
+        Write permissions:
+         - "a" = append data to an existing file (APPE command)
+         - "d" = delete file or directory (DELE, RMD commands)
+         - "f" = rename file or directory (RNFR, RNTO commands)
+         - "m" = create directory (MKD command)
+         - "w" = store a file to the server (STOR, STOU commands)
+         - "M" = change file mode (SITE CHMOD command)
+         - "T" = update file last modified time (MFMT command)
+        """
+        raise NotImplementedError
+
+    def add_anonymous(self, homedir, **kwargs):
+        """Add an anonymous user."""
+        self.add_user('anonymous', '', homedir, **kwargs)
+
+    def remove_user(self, username: str):
+        """Remove a user."""
+        raise NotImplementedError
+
+    async def override_perm(self, username: str, directory: str, perm: str, recursive=False):
+        """Override permissions for a given directory."""
+        raise NotImplementedError
+
+    async def validate_authentication(self, username: str, password: str, handler: 'FTPHandler'):
+        """
+        Raises AuthenticationFailed if supplied username and password
+        don't match, else return None
+        """
+        raise NotImplementedError
+
+    async def get_home_dir(self, username: str):
+        """Return the user's homedir."""
+        raise NotImplementedError
+
+    async def has_user(self, username: str) -> bool:
+        """To check whether the username specified exists."""
+        raise NotImplementedError
+
+    async def has_perm(self, username: str, perm: str, path: str = None):
+        """
+        Whether the user has permission over path.
+        Expected perm argument is one of the following letters: "elradfmwMT".
+        """
+        raise NotImplementedError
+
+    async def get_perms(self, username: str):
+        """Return current user permissions."""
+        raise NotImplementedError
+
+    async def get_msg_login(self, username):
+        """Return the user's login message."""
+        raise NotImplementedError
+
+    async def get_msg_quit(self, username: str):
+        """Return the user's quitting message."""
+
+    def __new__(cls, *args, **kwargs):
+        if not cls._single_instance:
+            cls._single_instance = super(AbstractAuthorizer, cls).__new__(cls, *args, **kwargs)
+        return cls._single_instance
+
+
+class DummyAuthorizer(AbstractAuthorizer):
     read_perms = "elr"
     write_perms = "adfmwMT"
 
@@ -42,25 +123,22 @@ class DummyAuthorizer:
     def has_user(self, username: str) -> bool:
         return username in self.user_table
 
-    def add_anonymous(self, homedir: str, **kwargs) -> None:
-        DummyAuthorizer.add_user(self, 'anonymous', '', homedir, **kwargs)
-
     def remove_user(self, username) -> None:
         del self.user_table[username]
 
-    def override_perm(self, username: str, directory: str, perm: str, recursive: bool = False) -> None:
+    async def override_perm(self, username: str, directory: str, perm: str, recursive: bool = False) -> None:
         self._check_permissions(username, perm)
         if not os.path.isdir(directory):
             raise ValueError("no such directory: %r" % directory)
         directory = os.path.normcase(os.path.realpath(directory))
-        home = os.path.normcase(self.get_home_dir(username))
+        home = os.path.normcase(await self.get_home_dir(username))
         if directory == home:
             raise ValueError("can't override home directory permissions")
         if not self._issubpath(directory, home):
             raise ValueError("path escapes user home directory")
         self.user_table[username]['operms'][directory] = perm, recursive
 
-    def validate_authentication(self, username: str, password: str, handler: 'FTPHandler') -> None:
+    async def validate_authentication(self, username: str, password: str, handler: 'FTPHandler') -> None:
         msg = "Authentication failed."
         if not self.has_user(username):
             if username == 'anonymous':
@@ -70,19 +148,12 @@ class DummyAuthorizer:
             if self.user_table[username]['pwd'] != password:
                 raise AuthenticationFailed(msg)
 
-    def get_home_dir(self, username: str) -> str:
+    async def get_home_dir(self, username: str) -> str:
         return self.user_table[username]['home']
 
-    def impersonate_user(self, username: str, password: str):
-        pass
-
-    def terminate_impersonation(self, username: str):
-        pass
-
-    def has_perm(self, username: str, perm: str, path: Union[str, None] = None) -> bool:
+    async def has_perm(self, username: str, perm: str, path: Union[str, None] = None) -> bool:
         if path is None:
             return perm in self.user_table[username]['perm']
-
         path = os.path.normcase(path)
         for dir in self.user_table[username]['operms'].keys():
             operm, recursive = self.user_table[username]['operms'][dir]
@@ -93,13 +164,13 @@ class DummyAuthorizer:
                     return perm in operm
         return perm in self.user_table[username]['perm']
 
-    def get_perms(self, username: str) -> str:
+    async def get_perms(self, username: str) -> str:
         return self.user_table[username]['perm']
 
-    def get_msg_login(self, username: str) -> str:
+    async def get_msg_login(self, username: str) -> str:
         return self.user_table[username]['msg_login']
 
-    def get_msg_quit(self, username: str) -> str:
+    async def get_msg_quit(self, username: str) -> str:
         try:
             return self.user_table[username]['msg_quit']
         except KeyError:
