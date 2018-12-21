@@ -1,5 +1,6 @@
 import glob
 import logging
+import os
 import socket
 import sys
 import time
@@ -7,7 +8,7 @@ from asyncio import Protocol, Transport, AbstractEventLoop, StreamWriter, Stream
 from typing import Union, Tuple, TYPE_CHECKING
 
 from .Authorizer import AuthenticationFailed, AuthorizerError, DummyAuthorizer, AbstractAuthorizer
-from .Filesystems import AbstractFilesystem
+from .Filesystems import AbstractFilesystem, FilesystemError
 from .dtp import ActiveDTP, PassiveDTP
 
 if TYPE_CHECKING:
@@ -480,10 +481,116 @@ class FTPHandler:
 
     # file action commands
 
+    async def ftp_ALLO(self, line):
+        await self.respond(202, "No storage allocation necessary")
+
+    async def ftp_ABOR(self, line):
+
     async def ftp_PWD(self, line):
         cwd = self.fs.cwd
         await self.respond(257, "%s is the current directory." % cwd.replace('"', '""'))
 
+    async def ftp_REST(self, line):
+        """Restart a file transfer from a previous mark."""
+        if self._current_type == 'a':
+            await self.respond(501, )
+            return
+        try:
+            marker = int(line)
+            if marker < 0:
+                raise ValueError
+        except (ValueError, OverflowError) as err:
+            await self.respond(501, "Invalid paramter")
+        else:
+            await self.respond(350, "Restarting at position %s." % marker)
+            self._restart_position = marker
+
+    async def ftp_STOR(self, file, mode='w'):
+        """
+        Store a file (transfer from the client to the server).
+        On success return the file path, else None.
+        """
+        if 'a' in mode:
+            cmd = 'APPE'
+        else:
+            cmd = 'STOR'
+        rest_pos = self._restart_position
+        self._restart_position = 0
+        if rest_pos:
+            mode = 'r+'
+        try:
+            fd = self.fs.open(file, mode + 'b')
+        except (EnvironmentError, FilesystemError) as err:
+            why = str(err)
+            await self.respond(550, "%s." % why)
+            return
+        try:
+            if rest_pos:
+                ok = 0
+                try:
+                    if rest_pos > self.fs.getsize(file):
+                        raise ValueError
+                    fd.seek(rest_pos)
+                    ok = 1
+                except ValueError:
+                    why = "Invalid REST parameter"
+                except (EnvironmentError, FilesystemError) as err:
+                    why = str(err)
+                if not ok:
+                    fd.close()
+                    await self.respond(554, '%s' % why)
+                    return
+            if self.data_channel is not None:
+                resp = "Data connection already open. Transfer starting."
+                await self.respond(125, resp)
+                self.data_channel.file_obj = fd
+                self.data_channel.enable_receiving(self._current_type, cmd)
+            else:
+                resp = "File status okay, About to open data connection."
+                await self.respond(150, resp)
+                self._in_dtp_queue = (fd, cmd)
+            return file
+        except Exception:
+            fd.close()
+            raise
+
+    async def ftp_STOU(self, line):
+        """
+        Store a file on the server with a unique name.
+        On success return the file path, else None.
+        """
+        if self._restart_position:
+            await self.respond(450, "Can't STOU while REST request is pending.")
+            return
+        if line:
+            basedir, prefix = os.path.split(self.fs.ftp2fs(line))
+            prefix = prefix + '.'
+        else:
+            basedir = self.fs.ftp2fs(self.fs.cwd)
+            prefix = 'ftpd.'
+
+    async def ftp_APPE(self, file):
+        """
+        Append data to an existing file on the server.
+        On success return the file path,else None
+        """
+        if self._restart_position:
+            await self.respond(450, "Can't APPE while REST request is pending.")
+        else:
+            return await self.ftp_STOR(file, mode='a')
+
+    # information commands
+
+    async def ftp_SYST(self, line):
+        await self.respond(215, "UNIX Type: L8")
+
+    # Miscellaneous commands
+
+    async def ftp_STAT(self, line):
+
+    async def ftp_NOOP(self, line):
+        """Do nothing"""
+        await self.respond(200, "I successfully done nothing.")
 
 class __FTPHandler(Protocol):
     # default classes

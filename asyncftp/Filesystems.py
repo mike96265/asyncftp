@@ -1,10 +1,10 @@
+import asyncio
+from concurrent.futures import ProcessPoolExecutor
 import os
-import time
-from functools import wraps, partial
-from typing import List, Iterable, TYPE_CHECKING, Union
 from stat import filemode as _filemode
 import stat
-from . import loop
+import time
+from typing import List, Iterable, TYPE_CHECKING, Union
 
 try:
     import pwd
@@ -23,26 +23,36 @@ _SIX_MONTHS = 180 * 24 * 60 * 60
 __all__ = ['FilesystemError', 'AbstractFilesystem']
 
 
-def pathchecker(func):
-    @wraps(func)
-    def wrap(instance, *args, **kwargs):
-        if len(args) != 0:
-            path = args[0]
-        else:
-            path = kwargs['path']
-        assert isinstance(path, str)
-        return func(instance, path)
+class AbstractAsyncLister:
 
-    return wrap
+    def __init__(self, loop=None):
+        self.loop = loop or asyncio.get_event_loop()
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        raise NotImplementedError
 
 
-def run_in_executor(func):
-    @wraps(func)
-    async def wrap(*args, **kwargs):
-        f = partial(func, *args, **kwargs)
-        return await loop.run_in_executor(None, f)
+class AsyncFileContext:
 
-    return wrap
+    def __init__(self, filesystem: 'AbstractFilesystem', args, kwargs):
+        self.close = None
+        self.filesystem = filesystem
+        self.args = args
+        self.kwargs = kwargs
+
+    async def __aenter__(self):
+        self.file = await self.filesystem._open(*self.args, **self.kwargs)
+        return self
+
+    async def __aexit__(self, *args):
+        if self.close is not None:
+            self.close()
+
+    def __await__(self):
+        return self.__aenter__().__await__()
 
 
 class FilesystemError(Exception):
@@ -65,50 +75,50 @@ class AbstractFilesystem:
     path will be seen as "/" by the client)
     """
 
-    def __init__(self, root: str, cmd_channel: 'FTPHandler'):
-        assert isinstance(root, str)
-        self._cwd = '/'
+    def __init__(self, root: str, handler: 'FTPHandler'):
+        if not os.path.isabs(root):
+            raise FilesystemError("the root directory should always be absolute")
         self._root = root
-        self._cmd_channel = cmd_channel
+        self.handler = handler
+        self._cwd = '/'
 
     @property
     def root(self) -> str:
-        """
-        :return: The user home directory
-        """
         return self._root
 
     @root.setter
-    @pathchecker
-    def root(self, path: str) -> None:
+    def root(self, path: str):
         self._root = path
 
     @property
     def cwd(self) -> str:
-        """
-        :return: the user current working directory
-        """
         return self.cwd
 
     @cwd.setter
-    @pathchecker
-    def cwd(self, path: str) -> None:
+    def cwd(self, path: str):
         self._cwd = path
 
-    @pathchecker
+    def chdir(self, path: str):
+        self.cwd = path
+
+    # method bellow manage path between ftp handler and filesystem,
+    # and usually has no need to deal with I/O
+    # 1. ftpnorm
+    # 2. ftp2fs
+    # 3. fs2ftp
+    # 4. realpath
+
     def ftpnorm(self, ftp_path: str) -> str:
         """
-        :param ftp_path: Virtual ftp pathname(typically the raw string
-        coming from client), depend on the current working directory.
-        :return: absolute path to ftp_path
+        Normalize a "virtual" ftp pathname (typically the raw string
+        coming from client) depending on the current working directory.
 
-        Example: ("/foo" is our current working directory)
-
-        >>> ftpnorm('bar')
+        Example (having "/foo" as current working directory):
+        >>> self.ftpnorm('bar')
         '/foo/bar'
 
-        Note: directory separators are system independent ("/"). Pathname
-        returned is always absolutized.
+        Note: directory separators are system independent ("/").
+        Pathname returned is always absolutized.
         """
         if os.path.isabs(ftp_path):
             p = os.path.normpath(ftp_path)
@@ -122,16 +132,38 @@ class AbstractFilesystem:
             p = '/'
         return p
 
-    @pathchecker
     def ftp2fs(self, ftp_path: str) -> str:
+        """
+        Translate a virtual ftp pathname (typically the raw string coming from client)
+        into equivalent absolute real filesystem pathname.
+
+        Example (having "/home/user" as root directory and /foo as cwd)
+
+        >>> self.ftp2fs("bar")
+        '/home/user/foo/bar'
+        """
         if os.path.normpath(self.root) == os.sep:
             return os.path.normpath(self.ftpnorm(ftp_path))
         else:
             p = self.ftpnorm(ftp_path)[1:]
             return os.path.normpath(os.path.join(self.root, p))
 
-    @pathchecker
     def fs2ftp(self, fs_path: str) -> str:
+        """
+        Translate a "real" filesystem pathname into equivalent absolute "virtual" ftp
+        pathname depending on the user's root directory.
+
+        Example (having "/home/user" as root directory):
+
+        >>> self.fs2ftp('/home/user/foo')
+        'foo'
+
+        As for ftpnorm, directory separators are system independent ("/") and pathname
+        returned is always absolute.
+
+        Pathname escaping from user's root directory (e.g. "/home" when
+        root is "/home/user") always return "/".
+        """
         if os.path.isabs(fs_path):
             p = os.path.normpath(fs_path)
         else:
@@ -140,8 +172,15 @@ class AbstractFilesystem:
             return '/'
         return p
 
-    @pathchecker
     def validpath(self, path: str) -> bool:
+        """
+        Check if the path belongs to user's home directory.
+        Expected argument is a "real" filesystem pathname.
+
+        If path is a symbolic link it is resolved to check its origin file.
+
+        Pathname escaping from user's root directory are considered not valid
+        """
         root = self.realpath(self.root)
         path = self.realpath(path)
         if not root.endswith(os.sep):
@@ -152,133 +191,132 @@ class AbstractFilesystem:
             return True
         return False
 
-    @pathchecker
-    def realpath(self, path: str) -> str:
-        return os.path.realpath(path)
+    realpath = os.path.realpath
 
-    @run_in_executor
-    def open(self, filename, mode):
-        assert isinstance(filename, str)
-        return open(filename, mode)
+    # method bellow is related to file management
+    # 1. isfile (public)
+    # 2. open (public)
+    # 3. remove (public)
+    # 4. islink (private)
+    # 5. readlink
 
-    @pathchecker
-    @run_in_executor
-    def chdir(self, path: str) -> None:
-        os.chdir(path)
-        self._cwd = self.fs2ftp(path)
+    async def isfile(self, path: str) -> bool:
+        raise NotImplementedError
 
-    @pathchecker
-    @run_in_executor
-    def mkdir(self, path: str) -> None:
-        os.mkdir(path)
+    async def _open(self, path: str, mode: str):
+        raise NotImplementedError
 
-    @pathchecker
-    def listdir(self, path: str) -> List[str]:
-        return os.listdir(path)
+    def open(self, *args, **kwargs):
+        raise NotImplementedError
 
-    @pathchecker
-    @run_in_executor
-    def rmdir(self, path: str) -> None:
-        os.remove(path)
+    async def remove(self, path: str):
+        raise NotImplementedError
 
-    @pathchecker
-    @run_in_executor
-    def remove(self, path: str):
-        os.remove(path)
+    async def islink(self, path: str) -> bool:
+        raise NotImplementedError
 
-    @run_in_executor
-    def rename(self, src: str, dst: str) -> None:
-        assert isinstance(src, str)
-        os.rename(src, dst)
+    async def readlink(self, path: str):
+        raise NotImplementedError
 
-    @run_in_executor
-    def chmod(self, path: str, mode: int):
-        if not hasattr(os, 'chmod'):
-            raise NotImplementedError
-        assert isinstance(path, str)
-        os.chmod(path, mode)
+    # method bellow is related to directory management
+    # 1. isdir (public)
+    # 2. mkdir (public)
+    # 3. rmdir (public)
+    # 4. listdir (public)
 
-    @pathchecker
-    def stat(self, path: str):
-        return os.stat(path)
+    async def isdir(self, path: str) -> bool:
+        raise NotImplementedError
 
-    @pathchecker
-    def utime(self, path: str, timeval):
-        return os.utime(path, (timeval, timeval))
+    async def mkdir(self, path: str):
+        raise NotImplementedError
 
-    if hasattr(os, 'lstat'):
-        @pathchecker
-        def lstat(self, path: str) -> os.stat_result:
-            return os.lstat(path)
-    else:
-        lstat = stat
+    async def rmdir(self, path: str):
+        raise NotImplementedError
 
-    if hasattr(os, 'readlink'):
-        @pathchecker
-        def readlink(self, path: str):
-            return os.readlink(path)
+    async def listdir(self, path: str) -> List[str]:
+        raise NotImplementedError
 
-    @pathchecker
-    def isfile(self, path: str) -> bool:
-        return os.path.isfile(path)
+    # method bellow is related to file and directory management
+    # 1. chdir (public)
+    # 2. rename (public)
+    # 3. utime (public)
+    # 4. stat (private)
+    # 5. lstat (public)
+    # 6. getsize (public)
+    # 7. getmtime (public)
+    # 8. lexists (public)
+    # 9. get_user_by_uid (private)
+    # 10. get_group_by_gid (private)
 
-    @pathchecker
-    def islink(self, path: str) -> bool:
-        return os.path.islink(path)
+    async def chmod(self, path: str, mode: int):
+        raise NotImplementedError
 
-    @pathchecker
-    def isdir(self, path: str) -> bool:
-        return os.path.isdir(path)
+    async def rename(self, src: str, dst: str):
+        raise NotImplementedError
 
-    @pathchecker
-    def getsize(self, path: str) -> int:
+    async def utime(self, path: str, timeval: int):
         """
-        Return the size of specified file in bytes.
+        Perform a utime() system call on given path.
+        utime() system call is to change file's last access time and modify time (atime, mtime)
         """
-        return os.path.getsize(path)
+        raise NotImplementedError
 
-    @pathchecker
-    def getmtime(self, path: str) -> int:
+    async def stat(self, path: str) -> os.stat_result:
         """
-        Return the last modified time as a number of seconds since the epoch.
+        Perform a stat() system call on given path.
+
+        Example:
+        >>> os.stat('/home/user/abc')
+        os.stat_result(st_mode=16877, st_ino=2533274790468575, st_dev=2, st_nlink=1, st_uid=1000,
+        st_gid=1000, st_size=4096, st_atime=1545288484, st_mtime=1545376980, st_ctime=1545401153)
         """
-        return os.path.getmtime(path)
+        raise NotImplementedError
 
-    @pathchecker
-    def lexists(self, path: str) -> bool:
-        return os.path.lexists(path)
+    async def lstat(self, path: str) -> os.stat_result:
+        """Like stat but does not follow symbolic links"""
+        raise NotImplementedError
 
-    if pwd is not None:
-        def get_user_by_uid(self, uid: int) -> Union[int, str]:
-            """
-            Return the username associated with user id.
-            If this can't be determined return the raw uid instead.
-            On Windows just return "owner"
-            """
+    async def getsize(self, path: str) -> int:
+        """Return the size of specified file in bytes."""
+        raise NotImplementedError
+
+    async def getmtime(self, path: str) -> int:
+        """Return the last modified time as a number of seconds since the epoch."""
+        raise NotImplementedError
+
+    async def lexists(self, path: str) -> bool:
+        raise NotImplementedError
+
+    def get_user_by_uid(self, uid: int) -> Union[int, str]:
+        """
+        Return the username associated with user id.
+        If this can't be determined return the raw uid instead.
+        On Windows just return "owner"
+        """
+        if pwd is not None:
             try:
                 return pwd.getpwuid(uid).pw_name
             except KeyError:
                 return uid
-    else:
-        def get_user_by_uid(self, uid: int) -> Union[int, str]:
+        else:
             return "owner"
 
-    if grp is not None:
-        def get_group_by_gid(self, gid: int) -> Union[int, str]:
-            """
-            Return the groupname associated with group id.
-            If this can't be determined return the row group id.
-            On Windows just return "group"
-            """
+    def get_group_by_gid(self, gid: int) -> Union[int, str]:
+        """
+        Return the groupname associated with group id.
+        If this can't be determined return the row group id.
+        On Windows just return "group"
+        """
+        if grp is not None:
             try:
                 return grp.getgroupid(gid).gr_name
             except KeyError:
                 return gid
-    else:
-        def get_group_by_gid(self, gid: int) -> Union[int, str]:
+        else:
             return "group"
 
-    @run_in_executor
+    # bellow method is direct related to ftp command list and mlsx
+
     def format_list(self, basedir: str, listing: List[str], ignore_err: bool = True) -> Iterable[str]:
         """
         :param basedir: the absolute dirname.
@@ -298,47 +336,8 @@ class AbstractFilesystem:
         drwxrwxrwx   1 owner   group          0 Aug 31 18:50 e-books
         -rw-rw-rw-   1 owner   group        380 Sep 02  3:40 module.py
         """
-        assert isinstance(basedir, str)
-        timefunc = time.localtime
-        readlink = getattr(self, 'readlink', None)
-        now = time.time()
-        for basename in listing:
-            file = os.path.join(basedir, basename)
-            try:
-                st = self.lstat(file)
-            except (OSError, FilesystemError):
-                if ignore_err:
-                    continue
-                raise
-            perms = _filemode(st.st_mode)
-            nlinks = st.st_nlink
-            if not nlinks:
-                nlinks = 1
-            size = st.st_size
-            uname = self.get_user_by_uid(st.st_uid)
-            gname = self.get_group_by_gid(st.st_gid)
-            mtime = timefunc(st.st_mtime)
-            if (now - st.st_mtime) > _SIX_MONTHS:
-                fmtstr = "%d  %Y"
-            else:
-                fmtstr = "%d %H:%M"
-            try:
-                mtimestr = "%s %s" % (_months_map[mtime.tm_mon], time.strftime(fmtstr, mtime))
-            except ValueError:
-                mtime = timefunc()
-                mtimestr = "%s %s" % (_months_map[mtime.tm_mon], time.strftime("%d %H:%M", mtime))
-            islink = (st.st_mode & 61400) == stat.S_IFLNK
-            if islink and readlink is not None:
-                try:
-                    basename = basename + " -> " + readlink(file)
-                except (OSError, FilesystemError):
-                    if not ignore_err:
-                        raise
-            line = "%s %3s %-8s %-8s %8s %s %s\r\n" % (
-                perms, nlinks, uname, gname, size, mtimestr, basename)
-            yield line.encode('utf8')
+        raise NotImplementedError
 
-    @run_in_executor
     def format_mlsx(self, basedir: str, listing: List[str], perms: str,
                     facts: str, ignore_err: bool = True) -> Iterable[str]:
         """
@@ -429,6 +428,161 @@ class AbstractFilesystem:
             yield line.encode('utf8')
 
 
+class BlockingFilesystem(AbstractFilesystem):
+
+    # method bellow is related to file management
+    # 1. isfile (public)
+    # 2. open (public)
+    # 3. remove (public)
+    # 4. islink (private)
+    # 5. readlink
+
+    async def isfile(self, path: str) -> bool:
+        return os.path.isfile(path)
+
+    async def _open(self, path: str, mode: str):
+        raise NotImplementedError
+
+    def open(self, file, mode='r', buffering=None, encoding=None, errors=None, newline=None, closefd=True):
+        return open()
+
+    async def remove(self, path: str):
+        return os.remove(path)
+
+    async def islink(self, path: str) -> bool:
+        return os.path.islink(path)
+
+    async def readlink(self, path):
+        return os.readlink(path)
+
+    # method bellow is related to directory management
+    # 1. isdir (public)
+    # 2. mkdir (public)
+    # 3. rmdir (public)
+    # 4. listdir (public)
+
+    async def isdir(self, path: str) -> bool:
+        return os.path.isdir(path)
+
+    async def mkdir(self, path: str):
+        return os.mkdir(path)
+
+    async def rmdir(self, path: str):
+        return os.rmdir(path)
+
+    async def listdir(self, path: str) -> List[str]:
+        return os.listdir(path)
+
+    # method bellow is related to file and directory management
+    # 1. chdir (public)
+    # 2. rename (public)
+    # 3. utime (public)
+    # 4. stat (private)
+    # 5. lstat (public)
+    # 6. getsize (public)
+    # 7. getmtime (public)
+    # 8. lexists (public)
+    # 9. get_user_by_uid (private)
+    # 10. get_group_by_gid (private)
+
+    async def chmod(self, path: str, mode: int):
+        return os.chmod(path, mode)
+
+    async def rename(self, src: str, dst: str):
+        return os.rename(src, dst)
+
+    async def utime(self, path: str, timeval: int):
+        """
+        Perform a utime() system call on given path.
+        utime() system call is to change file's last access time and modify time (atime, mtime)
+        """
+        return os.utime(path, (timeval, timeval))
+
+    async def stat(self, path: str) -> os.stat_result:
+        """
+        Perform a stat() system call on given path.
+
+        Example:
+        >>> os.stat('/home/user/abc')
+        os.stat_result(st_mode=16877, st_ino=2533274790468575, st_dev=2, st_nlink=1, st_uid=1000,
+        st_gid=1000, st_size=4096, st_atime=1545288484, st_mtime=1545376980, st_ctime=1545401153)
+        """
+        return os.stat(path)
+
+    async def lstat(self, path: str) -> os.stat_result:
+        """Like stat but does not follow symbolic links"""
+        return os.lstat(path)
+
+    async def getsize(self, path: str) -> int:
+        """Return the size of specified file in bytes."""
+        return os.path.getsize(path)
+
+    async def getmtime(self, path: str) -> int:
+        """Return the last modified time as a number of seconds since the epoch."""
+        return os.path.getmtime(path)
+
+    async def lexists(self, path: str) -> bool:
+        return os.path.lexists(path)
+
+    def format_list(self, basedir: str, listing: List[str], ignore_err: bool = True):
+        class Lister(AbstractAsyncLister):
+            iter = None
+
+            async def __anext__(lister):
+                if lister.iter is None:
+                    lister.iter = self._format_list(basedir, listing, ignore_err)
+                try:
+                    return next(lister.iter)
+                except StopIteration:
+                    raise StopAsyncIteration
+
+        return Lister(loop=self.handler.loop)
+
+    def _format_list(self, basedir: str, listing: List[str], ignore_err: bool = True):
+        if self.handler.use_gmt_times:
+            timefunc = time.gmtime
+        else:
+            timefunc = time.localtime
+        SIX_MONTH = 180 * 24 * 60 * 60
+        readlink = getattr(self, 'readlink', None)
+        now = time.time()
+        for filename in listing:
+            file = os.path.join(basedir, filename)
+            try:
+                st = os.lstat(file)
+            except (OSError, FilesystemError) as err:
+                if ignore_err:
+                    continue
+                raise err
+            perms = _filemode(st.st_mode)
+            nlinks = st.st_nlink
+            if not nlinks:
+                nlinks = 1
+            size = st.st_size
+            uname = self.get_user_by_uid(st.st_uid)
+            gname = self.get_group_by_gid(st.st_gid)
+            mtime = timefunc(st.st_mtime)
+            if (now - st.st_mtime) > SIX_MONTH:
+                fmtstr = "%d %Y"
+            else:
+                fmtstr = "%d %H:%M"
+            try:
+                mtimestr = "%s %s" % (_months_map[mtime.tm_mon], time.strftime(fmtstr, mtime))
+            except ValueError:
+                mtime = timefunc()
+                mtimestr = "%s %s" % (_months_map[mtime.tm_mon], time.strftime("%d %H:%M", mtime))
+            islink = (st.st_mode & 61400) == stat.S_IFLNK
+            if islink and readlink is not None:
+                try:
+                    filename = filename + " -> " + readlink(file)
+                except (OSError, FilesystemError) as err:
+                    if not ignore_err:
+                        raise err
+            line = "%s %3s %-8s %-8s %8s %s %s\r\n" % (
+                perms, nlinks, uname, gname, size, mtimestr, filename)
+            yield line
+
+
 if os.name == 'posix':
     __all__.append('UnixFileSystem')
 
@@ -441,8 +595,8 @@ if os.name == 'posix':
         and navigate the real filesystem.
         """
 
-        def __init__(self, root, cmd_channel):
-            AbstractFilesystem.__init__(self, root, cmd_channel)
+        def __init__(self, root, handler):
+            AbstractFilesystem.__init__(self, root, handler)
             # initial cwd was set to "/" to emulate a chroot jail
             self.cwd = root
 
