@@ -5,7 +5,7 @@ from asyncftp.Authorizer import DummyAuthorizer
 
 authorizer = DummyAuthorizer()
 
-authorizer.add_user('luvjoey', '1996829', 'd:/Users/luvjo/Documents/')
+authorizer.add_user('luvjoey', '******', 'd:/Users/luvjo/Documents/')
 
 loop = asyncio.get_event_loop()
 
