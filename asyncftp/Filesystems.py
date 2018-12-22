@@ -1,4 +1,5 @@
 import asyncio
+import functools
 from concurrent.futures import ProcessPoolExecutor
 import os
 from stat import filemode as _filemode
@@ -45,11 +46,15 @@ class AsyncFileContext:
 
     async def __aenter__(self):
         self.file = await self.filesystem._open(*self.args, **self.kwargs)
+        self.seek = functools.partial(self.filesystem.seek, self.file)
+        self.write = functools.partial(self.filesystem.write, self.file)
+        self.read = functools.partial(self.filesystem.read, self.file)
+        self.close = functools.partial(self.filesystem.close, self.file)
         return self
 
     async def __aexit__(self, *args):
         if self.close is not None:
-            self.close()
+            await self.close()
 
     def __await__(self):
         return self.__aenter__().__await__()
@@ -207,7 +212,7 @@ class AbstractFilesystem:
         raise NotImplementedError
 
     def open(self, *args, **kwargs):
-        raise NotImplementedError
+        return AsyncFileContext(self, args, kwargs)
 
     async def remove(self, path: str):
         raise NotImplementedError
@@ -216,6 +221,18 @@ class AbstractFilesystem:
         raise NotImplementedError
 
     async def readlink(self, path: str):
+        raise NotImplementedError
+
+    async def seek(self, file, *args, **kwargs):
+        raise NotImplementedError
+
+    async def write(self, file, *args, **kwargs):
+        raise NotImplementedError
+
+    async def read(self, file, *args, **kwargs):
+        raise NotImplementedError
+
+    async def close(self, file):
         raise NotImplementedError
 
     # method bellow is related to directory management
@@ -380,7 +397,7 @@ class AbstractFilesystem:
             retfacts = dict()
             file = os.path.join(bytes(basedir), bytes(basename))
             try:
-                st = self.stat(file)
+                st = os.stat(file)
             except (OSError, FilesystemError):
                 if ignore_err:
                     continue
@@ -440,11 +457,8 @@ class BlockingFilesystem(AbstractFilesystem):
     async def isfile(self, path: str) -> bool:
         return os.path.isfile(path)
 
-    async def _open(self, path: str, mode: str):
-        raise NotImplementedError
-
-    def open(self, file, mode='r', buffering=None, encoding=None, errors=None, newline=None, closefd=True):
-        return open()
+    async def _open(self, path: str, *args, **kwargs):
+        return open(path, *args, **kwargs)
 
     async def remove(self, path: str):
         return os.remove(path)
@@ -454,6 +468,18 @@ class BlockingFilesystem(AbstractFilesystem):
 
     async def readlink(self, path):
         return os.readlink(path)
+
+    async def seek(self, file, *args, **kwargs):
+        return file.seek(*args, **kwargs)
+
+    async def write(self, file, *args, **kwargs):
+        return file.write(*args, **kwargs)
+
+    async def read(self, file, *args, **kwargs):
+        return file.read(*args, **kwargs)
+
+    async def close(self, file):
+        return file.close()
 
     # method bellow is related to directory management
     # 1. isdir (public)
